@@ -1,0 +1,752 @@
+import { existsSync, readdirSync, readFileSync } from 'node:fs'
+import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import { extname } from 'node:path'
+import { parseArgs } from 'node:util'
+import modules from '@revenge-mod/types/modules.json' with { type: 'json' }
+import { parseSync, transform as swcTransform } from '@swc/core'
+import { rolldown } from 'rolldown'
+import type { Module } from '@swc/core'
+
+/**
+ * Imports listed here (and anything under `@revenge-mod/`) are NOT bundled.
+ * They are inlined to property access on `revenge`:
+ *
+ *   `@revenge-mod/discord/modules/main_tabs_v2`  ->  `revenge.discord.modules.mainTabsV2`
+ *
+ * i.e. drop the `@revenge-mod/` prefix and turn each `/`-separated, kebab/snake_case segment into a camelCase property access on `revenge`.
+ */
+const GlobalAliases: Record<string, string> = {
+	react: 'revenge.react.React',
+	'react-native': 'revenge.react.ReactNative',
+	'react/jsx-runtime': 'revenge.react.ReactJSXRuntime',
+	'react/jsx-dev-runtime': 'revenge.react.ReactJSXRuntime',
+	'@shopify/flash-list': 'revenge.externals.Shopify.FlashList',
+	'@react-native-clipboard/clipboard':
+		'revenge.externals.ReactNativeClipboard.Clipboard',
+}
+
+const HostRuntimeNamespaces = new Set(modules.map(mod => mod.split('/')[0]!))
+
+function isExternal(id: string): boolean {
+	if (id in GlobalAliases) return true
+	if (id === '@revenge-mod') return true
+	if (id.startsWith('@revenge-mod/')) {
+		const subPath = id.slice('@revenge-mod/'.length)
+		const firstSegment = subPath.split('/')[0]!
+		return HostRuntimeNamespaces.has(firstSegment)
+	}
+	return false
+}
+
+function toCamelCase(str: string): string {
+	return str.replace(/[-_]([a-z0-9])/g, (_, c: string) => c.toUpperCase())
+}
+
+function toPascalCase(str: string): string {
+	return str
+		.split(/[-_]/)
+		.filter(Boolean)
+		.map(seg => seg.charAt(0).toUpperCase() + seg.slice(1))
+		.join('')
+}
+
+function toGlobalPath(id: string): string {
+	if (id in GlobalAliases) return GlobalAliases[id]!
+
+	if (id === '@revenge-mod' || id.startsWith('@revenge-mod/')) {
+		const path = id.slice('@revenge-mod'.length).replace(/^\//, '')
+		const parts = path ? path.split('/') : []
+		const segments: string[] = []
+
+		let isExternals = false
+		for (const part of parts) {
+			if (part === 'externals') {
+				isExternals = true
+				segments.push('externals')
+			} else if (isExternals) {
+				segments.push(toPascalCase(part))
+			} else {
+				segments.push(toCamelCase(part))
+			}
+		}
+		return ['revenge', ...segments].join('.')
+	}
+
+	throw new Error(`Cannot map import to a Revenge global: ${id}`)
+}
+
+/**
+ * Rolldown plugin that uses SWC to transpile code using Revenge Next's exact Hermes SWC settings:
+ * https://github.com/facebook/hermes/blob/main/doc/Features.md
+ */
+const hermesSwcPlugin = {
+	name: 'hermes-swc',
+	async transform(code: string, id: string) {
+		if (!/\.[jt]sx?$/.test(id) || id.includes('node_modules')) return null
+
+		const ext = extname(id)
+		const ts = ext.includes('ts')
+		const tsx = ts ? ext.endsWith('x') : false
+		const jsx = !ts ? ext.endsWith('x') : false
+
+		const result = await swcTransform(code, {
+			filename: id,
+			jsc: {
+				transform: {
+					react: {
+						runtime: 'automatic',
+					},
+				},
+				parser: {
+					syntax: ts ? 'typescript' : 'ecmascript',
+					tsx,
+					jsx,
+				},
+			},
+			env: {
+				targets: 'fully supports es6',
+				include: [
+					'transform-arrow-functions',
+					'transform-async-generator-functions',
+					'transform-block-scoping',
+					'transform-classes',
+					'transform-duplicate-named-capturing-groups-regex',
+					'transform-named-capturing-groups-regex',
+				],
+				exclude: [
+					'transform-async-to-generator',
+					'transform-exponentiation-operator',
+					'transform-logical-assignment-operators',
+					'transform-nullish-coalescing-operator',
+					'transform-numeric-separator',
+					'transform-object-rest-spread',
+					'transform-optional-catch-binding',
+					'transform-optional-chaining',
+					'transform-parameters',
+					'transform-template-literals',
+				],
+			},
+		})
+
+		return {
+			code: result.code,
+			map: result.map ?? null,
+		}
+	},
+}
+
+/**
+ * Asset loader plugin that converts imported files into exports:
+ * - Raw (.json): default export object
+ * - Images (.png, .jpg, .jpeg, .webp, .svg): default export base64 data URI string
+ */
+const fileParserPlugin = {
+	name: 'file-parser',
+	async load(id: string) {
+		const parsers: Record<string, string[]> = {
+			raw: ['json'],
+			uri: ['png', 'jpg', 'jpeg', 'webp', 'svg'],
+		}
+		const extToMime: Record<string, string> = {
+			png: 'image/png',
+			jpg: 'image/jpeg',
+			jpeg: 'image/jpeg',
+			webp: 'image/webp',
+			svg: 'image/svg+xml',
+		}
+
+		const ext = extname(id).slice(1).toLowerCase()
+		const mode = Object.entries(parsers).find(([_, exts]) =>
+			exts.includes(ext),
+		)?.[0]
+		if (!mode) return null
+
+		let exportedContent: string
+		if (mode === 'text') {
+			const text = await readFile(id, 'utf8')
+			exportedContent = JSON.stringify(text)
+		} else if (mode === 'raw') {
+			exportedContent = await readFile(id, 'utf8')
+		} else if (mode === 'uri') {
+			const buf = await readFile(id)
+			const mime = extToMime[ext] ?? 'application/octet-stream'
+			exportedContent = JSON.stringify(
+				`data:${mime};base64,${buf.toString('base64')}`,
+			)
+		} else {
+			return null
+		}
+
+		return {
+			code: `export default ${exportedContent};`,
+			map: null,
+		}
+	},
+}
+
+/**
+ * AST node types where an Identifier represents a pattern, declaration, or type definition,
+ * rather than an expression value access.
+ */
+const DECLARATION_AND_PATTERN_TYPES = new Set([
+	'VariableDeclarator',
+	'FunctionDeclaration',
+	'FunctionExpression',
+	'ClassDeclaration',
+	'ClassExpression',
+	'Parameter',
+	'FormalParameter',
+	'RestElement',
+	'CatchClause',
+	'ObjectPattern',
+	'ArrayPattern',
+	'AssignmentPattern',
+	'AssignmentPatternProperty',
+	'BindingProperty',
+	'KeyedBindingProperty',
+	'Property',
+	'KeyValueProperty',
+	'ClassProperty',
+	'PrivateProperty',
+	'ClassMethod',
+	'PrivateMethod',
+	'MethodDefinition',
+	'ExportSpecifier',
+	'ExportDefaultSpecifier',
+	'ExportNamespaceSpecifier',
+	'ExportNamedDeclaration',
+	'ImportSpecifier',
+	'ImportDefaultSpecifier',
+	'ImportNamespaceSpecifier',
+	'ImportDeclaration',
+	'JSXAttribute',
+	'TsTypeReference',
+	'TsTypeAnnotation',
+	'TsInterfaceDeclaration',
+	'TsTypeAliasDeclaration',
+	'TsEnumDeclaration',
+	'TsEnumMember',
+	'TsTypeParameter',
+	'TsTypeParameterDeclaration',
+	'TsTypeParameterInstantiation',
+	'TsPropertySignature',
+	'TsMethodSignature',
+	'TsIndexSignature',
+	'TsGetterSignature',
+	'TsSetterSignature',
+	'TsNamespaceDeclaration',
+	'TsModuleDeclaration',
+])
+
+interface TextEdit {
+	start: number
+	end: number
+	replacement: string
+}
+
+function isExpressionIdentifier(
+	_node: any,
+	parent: any,
+	parentKey: any,
+): boolean {
+	if (!parent) return true
+
+	if (
+		parent.type === 'MemberExpression' &&
+		parentKey === 'property' &&
+		!parent.computed
+	) {
+		return false
+	}
+	if (parent.type === 'VariableDeclarator') {
+		return parentKey !== 'id'
+	}
+	if (
+		parent.type === 'FunctionDeclaration' ||
+		parent.type === 'FunctionExpression' ||
+		parent.type === 'ClassDeclaration' ||
+		parent.type === 'ClassExpression'
+	) {
+		return parentKey !== 'id'
+	}
+	if (
+		(parent.type === 'KeyValueProperty' ||
+			parent.type === 'Property' ||
+			parent.type === 'KeyValuePatternProperty') &&
+		parentKey === 'key' &&
+		!parent.computed
+	) {
+		return false
+	}
+	if (
+		(parent.type === 'ClassProperty' ||
+			parent.type === 'PrivateProperty' ||
+			parent.type === 'ClassMethod' ||
+			parent.type === 'PrivateMethod' ||
+			parent.type === 'MethodDefinition') &&
+		parentKey === 'key'
+	) {
+		return false
+	}
+	if (parent.type === 'AssignmentExpression') {
+		return parentKey !== 'left'
+	}
+	if (parent.type === 'CatchClause' && parentKey === 'param') {
+		return false
+	}
+	if (parent.type === 'JSXAttribute' && parentKey === 'name') {
+		return false
+	}
+	return !DECLARATION_AND_PATTERN_TYPES.has(parent.type)
+}
+
+function extractImportedSymbols(
+	ast: Module,
+	edits: TextEdit[],
+	_buf: Buffer,
+): {
+	symbolMap: Map<string, string>
+	addEdit: (start: number, end: number, replacement: string) => void
+} {
+	const symbolMap = new Map<string, string>()
+
+	for (const node of ast.body) {
+		if (node.type !== 'ImportDeclaration') continue
+
+		const source = node.source.value
+		if (!isExternal(source) || source.startsWith('react/jsx')) continue
+
+		const globalPath = toGlobalPath(source)
+
+		for (const spec of node.specifiers || []) {
+			if (
+				spec.type === 'ImportDefaultSpecifier' ||
+				spec.type === 'ImportNamespaceSpecifier'
+			) {
+				symbolMap.set(spec.local.value, globalPath)
+			} else if (spec.type === 'ImportSpecifier') {
+				const imported = spec.imported ? spec.imported.value : spec.local.value
+				symbolMap.set(spec.local.value, `${globalPath}.${imported}`)
+			}
+		}
+	}
+
+	const processedSpans = new Set<string>()
+	function addEdit(start: number, end: number, replacement: string) {
+		const key = `${start}:${end}:${replacement}`
+		if (processedSpans.has(key)) return
+		processedSpans.add(key)
+		edits.push({ start, end, replacement })
+	}
+
+	// Automatically resolve top-level destructuring/assignment aliases from imported symbols
+	let expanded = true
+	while (expanded) {
+		expanded = false
+		for (const node of ast.body) {
+			if (node.type !== 'VariableDeclaration') continue
+
+			let allImportDerived = true
+			for (const decl of node.declarations) {
+				if (!decl.init) {
+					allImportDerived = false
+					continue
+				}
+
+				let baseTarget: string | null = null
+				if (decl.init.type === 'Identifier' && symbolMap.has(decl.init.value)) {
+					baseTarget = symbolMap.get(decl.init.value)!
+				} else if (
+					decl.init.type === 'MemberExpression' &&
+					decl.init.object.type === 'Identifier' &&
+					decl.init.property.type === 'Identifier' &&
+					symbolMap.has(decl.init.object.value)
+				) {
+					const baseObj = symbolMap.get(decl.init.object.value)!
+					const propName = decl.init.property.value
+					baseTarget = `${baseObj}.${propName}`
+				}
+
+				if (!baseTarget) {
+					allImportDerived = false
+					continue
+				}
+
+				if (decl.id.type === 'ObjectPattern') {
+					for (const prop of decl.id.properties) {
+						if (prop.type === 'AssignmentPatternProperty') {
+							const name = prop.key.value
+							if (!symbolMap.has(name)) {
+								symbolMap.set(name, `${baseTarget}.${name}`)
+								expanded = true
+							}
+						} else if (
+							prop.type === 'KeyValuePatternProperty' &&
+							prop.key.type === 'Identifier' &&
+							prop.value.type === 'Identifier'
+						) {
+							const key = prop.key.value
+							const value = prop.value.value
+							if (!symbolMap.has(value)) {
+								symbolMap.set(value, `${baseTarget}.${key}`)
+								expanded = true
+							}
+						}
+					}
+				} else if (decl.id.type === 'Identifier') {
+					const name = decl.id.value
+					if (!symbolMap.has(name)) {
+						symbolMap.set(name, baseTarget)
+						expanded = true
+					}
+				}
+			}
+
+			if (allImportDerived) {
+				addEdit(node.span.start - 1, node.span.end - 1, '')
+			}
+		}
+	}
+
+	return { symbolMap, addEdit }
+}
+
+function isPureReadExpression(node: any): boolean {
+	if (!node) return false
+	if (node.type === 'Identifier') return true
+	if (node.type === 'MemberExpression') {
+		if (node.computed) {
+			return (
+				isPureReadExpression(node.object) && isPureReadExpression(node.property)
+			)
+		}
+		return isPureReadExpression(node.object)
+	}
+	return false
+}
+
+function collectIdentifierEdits(
+	ast: Module,
+	symbolMap: Map<string, string>,
+	addEdit: (start: number, end: number, replacement: string) => void,
+): void {
+	function traverse(node: any, parent: any, parentKey: any) {
+		if (!node || typeof node !== 'object') return
+		if (node.type === 'ImportDeclaration') {
+			if (
+				isExternal(node.source.value) &&
+				!node.source.value.startsWith('react/jsx')
+			) {
+				addEdit(node.span.start - 1, node.span.end - 1, '')
+			}
+			return
+		}
+
+		if (node.type === 'ExpressionStatement') {
+			if (isPureReadExpression(node.expression)) {
+				addEdit(node.span.start - 1, node.span.end - 1, '')
+				return
+			}
+			if (node.expression && node.expression.type === 'SequenceExpression') {
+				const exprs = node.expression.expressions
+				for (let i = 0; i < exprs.length; i++) {
+					const childExpr = exprs[i]
+					if (isPureReadExpression(childExpr)) {
+						const start = childExpr.span.start - 1
+						const end = childExpr.span.end - 1
+						if (i > 0) {
+							const prevEnd = exprs[i - 1].span.end - 1
+							addEdit(prevEnd, end, '')
+						} else if (i < exprs.length - 1) {
+							const nextStart = exprs[i + 1].span.start - 1
+							addEdit(start, nextStart, '')
+						} else {
+							addEdit(node.span.start - 1, node.span.end - 1, '')
+						}
+					}
+				}
+			}
+		}
+
+		if (node.type === 'Identifier' && symbolMap.has(node.value) && node.span) {
+			if (isExpressionIdentifier(node, parent, parentKey)) {
+				addEdit(
+					node.span.start - 1,
+					node.span.end - 1,
+					symbolMap.get(node.value)!,
+				)
+			}
+			return
+		}
+
+		for (const key of Object.keys(node)) {
+			if (key === 'span' || key === 'ctxt') continue
+			const child = node[key]
+			if (Array.isArray(child)) {
+				for (let i = 0; i < child.length; i++) {
+					traverse(child[i], node, i)
+				}
+			} else if (child && typeof child === 'object') {
+				traverse(child, node, key)
+			}
+		}
+	}
+
+	traverse(ast, null, null)
+}
+
+function applyEditsToBuffer(code: string, edits: TextEdit[]): string {
+	edits.sort((a, b) => b.start - a.start || b.end - a.end)
+	let buf = Buffer.from(code, 'utf8')
+
+	for (const { start, end, replacement } of edits) {
+		buf = Buffer.concat([
+			buf.subarray(0, start),
+			Buffer.from(replacement, 'utf8'),
+			buf.subarray(end),
+		])
+	}
+
+	return buf.toString('utf8')
+}
+
+/**
+ * Rolldown plugin that uses SWC AST parsing to inline external module imports (`@revenge-mod/*`, `react`, `react-native`)
+ * directly into global property accesses on `revenge` at usage sites inside functions/components.
+ *
+ * This avoids any top-level variable binding or preInit property evaluation issues.
+ */
+const inlineImportsPlugin = {
+	name: 'inline-imports',
+	transform(code: string, id: string) {
+		if (!/\.[jt]sx?$/.test(id) || id.includes('node_modules')) return
+
+		const isTs = id.endsWith('.ts') || id.endsWith('.tsx')
+		const isJsx = id.endsWith('.tsx') || id.endsWith('.jsx')
+
+		let ast: Module
+		try {
+			ast = parseSync(code, {
+				syntax: isTs ? 'typescript' : 'ecmascript',
+				tsx: isJsx,
+				jsx: isJsx,
+			})
+		} catch {
+			return null
+		}
+
+		const edits: TextEdit[] = []
+		const buf = Buffer.from(code, 'utf8')
+		const { symbolMap, addEdit } = extractImportedSymbols(ast, edits, buf)
+		if (symbolMap.size === 0) return null
+
+		collectIdentifierEdits(ast, symbolMap, addEdit)
+		if (edits.length === 0) return null
+
+		return {
+			code: applyEditsToBuffer(code, edits),
+			map: null,
+		}
+	},
+}
+
+const ENTRY_CANDIDATES = [
+	'js/index.ts',
+	'js/index.tsx',
+	'js/index.js',
+	'js/index.jsx',
+	'src/index.ts',
+	'src/index.tsx',
+	'src/index.js',
+	'src/index.jsx',
+	'index.ts',
+	'index.tsx',
+	'index.js',
+	'index.jsx',
+]
+
+function cleanupBundleCode(code: string): string {
+	try {
+		const ast = parseSync(code, { syntax: 'ecmascript' })
+		const edits: TextEdit[] = []
+		function visit(node: any) {
+			if (!node || typeof node !== 'object') return
+			if (node.type === 'ExpressionStatement') {
+				if (isPureReadExpression(node.expression)) {
+					edits.push({
+						start: node.span.start - 1,
+						end: node.span.end - 1,
+						replacement: '',
+					})
+					return
+				}
+				if (node.expression && node.expression.type === 'SequenceExpression') {
+					const exprs = node.expression.expressions
+					for (let i = 0; i < exprs.length; i++) {
+						const childExpr = exprs[i]
+						if (isPureReadExpression(childExpr)) {
+							const start = childExpr.span.start - 1
+							const end = childExpr.span.end - 1
+							if (i > 0) {
+								const prevEnd = exprs[i - 1].span.end - 1
+								edits.push({
+									start: prevEnd,
+									end,
+									replacement: '',
+								})
+							} else if (i < exprs.length - 1) {
+								const nextStart = exprs[i + 1].span.start - 1
+								edits.push({
+									start,
+									end: nextStart,
+									replacement: '',
+								})
+							} else {
+								edits.push({
+									start: node.span.start - 1,
+									end: node.span.end - 1,
+									replacement: '',
+								})
+							}
+						}
+					}
+				}
+			}
+			for (const key of Object.keys(node)) {
+				if (key === 'span' || key === 'ctxt') continue
+				const child = node[key]
+				if (Array.isArray(child)) {
+					for (const c of child) visit(c)
+				} else if (child && typeof child === 'object') {
+					visit(child)
+				}
+			}
+		}
+
+		visit(ast)
+		if (edits.length > 0) {
+			return applyEditsToBuffer(code, edits)
+		}
+	} catch {}
+	return code
+}
+
+export async function run(argv: string[]): Promise<void> {
+	const { values, positionals } = parseArgs({
+		args: argv,
+		allowPositionals: true,
+		options: {
+			dev: { type: 'boolean', short: 'd', default: false },
+			'plugins-dir': { type: 'string', default: 'plugins' },
+			help: { type: 'boolean', short: 'h', default: false },
+		},
+	})
+	if (values.help) {
+		console.log(`Usage: revenge-plugin build [names...] [--dev] [--plugins-dir <dir>]
+
+Bundles each plugin's index.{ts,tsx,js,jsx} (in the plugin root or js/) into
+<plugin>/build/js/index.js. Positional names select specific plugins; otherwise
+every plugin is built.`)
+		return
+	}
+
+	const dev = values.dev
+	const pluginsDir = values['plugins-dir']
+	const names = positionals.length ? positionals : readdirSync(pluginsDir)
+
+	for (const name of names) {
+		const dir = `${pluginsDir}/${name}`
+		const manifestPath = `${dir}/manifest.json`
+		if (!existsSync(manifestPath)) continue
+
+		const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
+		const script: string | undefined = manifest.dist?.script
+		if (!script) continue // No JS portion.
+
+		const entry = ENTRY_CANDIDATES.map(c => `${dir}/${c}`).find(existsSync)
+		if (!entry) {
+			console.warn(
+				`! ${name}: dist.script is set but no index.{ts,tsx,js,jsx} found; skipping JS`,
+			)
+			continue
+		}
+
+		try {
+			const bundle = await rolldown({
+				input: entry,
+				platform: 'neutral',
+				external: isExternal,
+				plugins: [fileParserPlugin, inlineImportsPlugin, hermesSwcPlugin],
+				resolve: {
+					mainFields: ['module', 'main'],
+					extensions: [
+						'.tsx',
+						'.ts',
+						'.jsx',
+						'.js',
+						'.mjs',
+						'.cjs',
+						'.json',
+						'.png',
+						'.jpg',
+						'.jpeg',
+						'.webp',
+						'.svg',
+					],
+				},
+				transform: {
+					target: 'es2020',
+					jsx: {
+						// Compiles to `react/jsx-runtime` imports, which remaps to `revenge.react.ReactJSXRuntime`. 
+						runtime: 'automatic',
+						// We don't expose jsxDev
+						development: false,
+					},
+					define: {
+						__DEV__: String(dev),
+						IS_DEV: String(dev),
+					},
+				},
+				onwarn(warning, warn) {
+					if (warning.code === 'MISSING_NAME_OPTION_FOR_IIFE_EXPORT') return
+					if (warning.code === 'MIXED_EXPORTS') return
+					// Plugins set `jsx: "preserve"` so TSC only typechecks and the bundler transforms.
+					// Setting it here (rather than inheriting tsconfig) keeps outputs deterministic, so the "overridden" notice is expected.
+					if (
+						warning.code === 'CONFIGURATION_FIELD_CONFLICT' &&
+						warning.message.includes('jsx')
+					)
+						return
+
+					warn(warning)
+				},
+			})
+
+			const { output } = await bundle.generate({
+				format: 'iife',
+				globals: toGlobalPath,
+				exports: 'named',
+				esModule: false,
+				minify: dev ? 'dce-only' : true,
+			})
+			await bundle.close()
+
+			const chunk = output[0]!
+			if (!chunk.exports.length)
+				throw new Error(
+					`${entry} has no default export. A plugin must have an entrypoint:\n` +
+						'`export default plugin({ ... })`.',
+				)
+
+			const outDir = `${dir}/build/js`
+			await mkdir(outDir, { recursive: true })
+			const outCode = cleanupBundleCode(chunk.code)
+			await writeFile(`${outDir}/index.js`, outCode, 'utf8')
+
+			console.log(`\u2713 Built JS for ${manifest.id ?? name}`)
+		} catch (e) {
+			console.error(`\u2717 Failed to build JS for ${name}:`, e)
+			process.exitCode = 1
+		}
+	}
+}
