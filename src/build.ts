@@ -496,10 +496,19 @@ function collectIdentifierEdits(
 }
 
 function applyEditsToBuffer(code: string, edits: TextEdit[]): string {
-	edits.sort((a, b) => b.start - a.start || b.end - a.end)
-	let buf = Buffer.from(code, 'utf8')
+	// Get the outermost non-overlapping edits
+	const ordered = [...edits].sort((a, b) => a.start - b.start || b.end - a.end)
+	const applicable: TextEdit[] = []
+	let coveredUntil = -1
+	for (const edit of ordered) {
+		if (edit.start < coveredUntil) continue
+		applicable.push(edit)
+		coveredUntil = edit.end
+	}
 
-	for (const { start, end, replacement } of edits) {
+	let buf = Buffer.from(code, 'utf8')
+	for (let i = applicable.length - 1; i >= 0; i--) {
+		const { start, end, replacement } = applicable[i]!
 		buf = Buffer.concat([
 			buf.subarray(0, start),
 			Buffer.from(replacement, 'utf8'),
@@ -511,6 +520,41 @@ function applyEditsToBuffer(code: string, edits: TextEdit[]): string {
 }
 
 /**
+ * Rewrites one module: external imports are erased and every use of an imported symbol becomes a property access on `revenge`.
+ * Returns `null` when the module imports nothing external.
+ */
+export function inlineExternalImports(
+	code: string,
+	id: string,
+): string | null {
+	if (!/\.[jt]sx?$/.test(id) || id.includes('node_modules')) return null
+
+	const isTs = id.endsWith('.ts') || id.endsWith('.tsx')
+	const isJsx = id.endsWith('.tsx') || id.endsWith('.jsx')
+
+	let ast: Module
+	try {
+		ast = parseSync(code, {
+			syntax: isTs ? 'typescript' : 'ecmascript',
+			tsx: isJsx,
+			jsx: isJsx,
+		})
+	} catch {
+		return null
+	}
+
+	const edits: TextEdit[] = []
+	const buf = Buffer.from(code, 'utf8')
+	const { symbolMap, addEdit } = extractImportedSymbols(ast, edits, buf)
+	if (symbolMap.size === 0) return null
+
+	collectIdentifierEdits(ast, symbolMap, addEdit)
+	if (edits.length === 0) return null
+
+	return applyEditsToBuffer(code, edits)
+}
+
+/**
  * Rolldown plugin that uses SWC AST parsing to inline external module imports (`@revenge-mod/*`, `react`, `react-native`)
  * directly into global property accesses on `revenge` at usage sites inside functions/components.
  *
@@ -519,32 +563,11 @@ function applyEditsToBuffer(code: string, edits: TextEdit[]): string {
 const inlineImportsPlugin = {
 	name: 'inline-imports',
 	transform(code: string, id: string) {
-		if (!/\.[jt]sx?$/.test(id) || id.includes('node_modules')) return
-
-		const isTs = id.endsWith('.ts') || id.endsWith('.tsx')
-		const isJsx = id.endsWith('.tsx') || id.endsWith('.jsx')
-
-		let ast: Module
-		try {
-			ast = parseSync(code, {
-				syntax: isTs ? 'typescript' : 'ecmascript',
-				tsx: isJsx,
-				jsx: isJsx,
-			})
-		} catch {
-			return null
-		}
-
-		const edits: TextEdit[] = []
-		const buf = Buffer.from(code, 'utf8')
-		const { symbolMap, addEdit } = extractImportedSymbols(ast, edits, buf)
-		if (symbolMap.size === 0) return null
-
-		collectIdentifierEdits(ast, symbolMap, addEdit)
-		if (edits.length === 0) return null
+		const transformed = inlineExternalImports(code, id)
+		if (transformed === null) return null
 
 		return {
-			code: applyEditsToBuffer(code, edits),
+			code: transformed,
 			map: null,
 		}
 	},

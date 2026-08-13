@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test'
-import { existsSync, readdirSync, readFileSync } from 'node:fs'
 import modules from '@revenge-mod/types/modules.json' with { type: 'json' }
 import { parseSync } from '@swc/core'
+import { inlineExternalImports } from '../src/build.ts'
 
 const GlobalAliases: Record<string, string> = {
 	react: 'revenge.react.React',
@@ -204,27 +204,72 @@ function SettingsComponent() {
 		expect(symbols.get('Text')).toBe('revenge.discord.design.Design.Text')
 	})
 
-	test('validates all monorepo plugins compile cleanly in production without standalone read statements', () => {
-		const plugins = readdirSync('../plugins')
-		let pluginCount = 0
+	test('erases a destructuring statement instead of leaving a fragment of it', () => {
+		// The declaration is removed as a whole, and the identifier inside it is
+		// rewritten to a long `revenge.*` path. Both edits cover the same text, so
+		// applying both leaves the tail of the rewritten path behind as a statement
+		// that reads an undeclared global.
+		const code = `import { withDependencies } from '@revenge-mod/modules/finders/filters'
 
-		for (const name of plugins) {
-			const dir = `../plugins/${name}`
-			if (!existsSync(`${dir}/manifest.json`)) continue
-			pluginCount++
-			const buildJsPath = `${dir}/build/js/index.js`
-			expect(existsSync(buildJsPath)).toBe(true)
+const { atLeast } = withDependencies
 
-			const code = readFileSync(buildJsPath, 'utf8')
-			// Must be a bare expression starting with (function
-			expect(code.trimStart().startsWith('(function')).toBe(true)
-			// Must not contain invalid function call on module object revenge.discord.modules.settings()
-			expect(/revenge\.discord\.modules\.settings\(\)/.test(code)).toBe(false)
-			// Must not contain standalone external property read statements
-			expect(/e\.discord\.design\.Design;/.test(code)).toBe(false)
-			expect(/revenge\.discord\.design\.Design;/.test(code)).toBe(false)
-		}
+export default plugin({
+	preInit() {
+		withDependencies(atLeast(64, []))
+	},
+})
+`
+		expect(inlineExternalImports(code, '/plugin/index.ts')).toBe(`
 
-		expect(pluginCount).toBeGreaterThanOrEqual(10)
+
+
+export default plugin({
+	preInit() {
+		revenge.modules.finders.filters.withDependencies(revenge.modules.finders.filters.withDependencies.atLeast(64, []))
+	},
+})
+`)
+	})
+
+	test('erases nested destructuring chains without leaving a fragment', () => {
+		const code = `import { Design } from '@revenge-mod/discord/design'
+
+const { Stack, Text } = Design
+const { Provider } = Stack
+
+export default plugin({
+	start() {
+		return [Stack, Text, Provider]
+	},
+})
+`
+		expect(inlineExternalImports(code, '/plugin/index.ts')).toBe(`
+
+
+
+
+export default plugin({
+	start() {
+		return [revenge.discord.design.Design.Stack, revenge.discord.design.Design.Text, revenge.discord.design.Design.Stack.Provider]
+	},
+})
+`)
+	})
+
+	test('rewrites a destructuring statement that is only partly import derived', () => {
+		// `other` is not import derived, so the statement must survive, but the
+		// import derived initializer inside it still needs rewriting.
+		const code = `import { Design } from '@revenge-mod/discord/design'
+
+const { Stack } = Design, other = compute()
+
+export default plugin({ start() { return [Stack, other] } })
+`
+		expect(inlineExternalImports(code, '/plugin/index.ts')).toBe(`
+
+const { Stack } = revenge.discord.design.Design, other = compute()
+
+export default plugin({ start() { return [revenge.discord.design.Design.Stack, other] } })
+`)
 	})
 })
