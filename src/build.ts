@@ -2,20 +2,31 @@ import { existsSync, readdirSync, readFileSync } from 'node:fs'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { extname } from 'node:path'
 import { parseArgs } from 'node:util'
+import hiddenImportMap from '@revenge-mod/types/modules.hidden.importmap.json' with { type: 'json' }
+import hiddenModules from '@revenge-mod/types/modules.hidden.json' with { type: 'json' }
+import publicImportMap from '@revenge-mod/types/modules.importmap.json' with { type: 'json' }
 import modules from '@revenge-mod/types/modules.json' with { type: 'json' }
 import { parseSync, transform as swcTransform } from '@swc/core'
 import { rolldown } from 'rolldown'
 import type { Module } from '@swc/core'
 
 /**
- * Imports listed here (and anything under `@revenge-mod/`) are NOT bundled.
- * They are inlined to property access on `revenge`:
+ * How the global holding a module relates to the module itself.
  *
- *   `@revenge-mod/discord/modules/main_tabs_v2`  ->  `revenge.discord.modules.mainTabsV2`
- *
- * i.e. drop the `@revenge-mod/` prefix and turn each `/`-separated, kebab/snake_case segment into a camelCase property access on `revenge`.
+ * - `namespace`: the global is the module namespace. A default import reads `.default`.
+ * - `default`: the global IS the default export. A namespace import cannot be expressed.
+ * - `cjs`: the global is a CommonJS `module.exports`. A default import reads the global itself.
  */
-const GlobalAliases: Record<string, string> = {
+type Interop = 'namespace' | 'default' | 'cjs'
+
+interface ExternalTarget {
+	global: string
+	interop: Interop
+}
+
+type ImportMapEntry = string | { global: string; interop?: 'default' }
+
+const GlobalImportAliases: Record<string, string> = {
 	react: 'revenge.react.React',
 	'react-native': 'revenge.react.ReactNative',
 	'react/jsx-runtime': 'revenge.react.ReactJSXRuntime',
@@ -23,56 +34,44 @@ const GlobalAliases: Record<string, string> = {
 	'@shopify/flash-list': 'revenge.externals.Shopify.FlashList',
 	'@react-native-clipboard/clipboard':
 		'revenge.externals.ReactNativeClipboard.Clipboard',
+	'@react-navigation/stack': 'revenge.externals.ReactNavigation.ReactNavigationStack',
+	'@react-navigation/native': 'revenge.externals.ReactNavigation.ReactNavigationNative',
 }
 
-const HostRuntimeNamespaces = new Set(modules.map(mod => mod.split('/')[0]!))
+const ImportMap = {
+	...publicImportMap,
+	...hiddenImportMap,
+} as Record<string, ImportMapEntry>
+
+const TypeOnlyModules = new Set(
+	[...modules, ...hiddenModules]
+		.map(mod => `@revenge-mod/${mod}`)
+		.filter(id => !(id in ImportMap)),
+)
 
 function isExternal(id: string): boolean {
-	if (id in GlobalAliases) return true
-	if (id === '@revenge-mod') return true
-	if (id.startsWith('@revenge-mod/')) {
-		const subPath = id.slice('@revenge-mod/'.length)
-		const firstSegment = subPath.split('/')[0]!
-		return HostRuntimeNamespaces.has(firstSegment)
-	}
-	return false
+	if (id in GlobalImportAliases) return true
+
+	return id in ImportMap || TypeOnlyModules.has(id)
 }
 
-function toCamelCase(str: string): string {
-	return str.replace(/[-_]([a-z0-9])/g, (_, c: string) => c.toUpperCase())
-}
-
-function toPascalCase(str: string): string {
-	return str
-		.split(/[-_]/)
-		.filter(Boolean)
-		.map(seg => seg.charAt(0).toUpperCase() + seg.slice(1))
-		.join('')
-}
-
-function toGlobalPath(id: string): string {
-	if (id in GlobalAliases) return GlobalAliases[id]!
-
-	if (id === '@revenge-mod' || id.startsWith('@revenge-mod/')) {
-		const path = id.slice('@revenge-mod'.length).replace(/^\//, '')
-		const parts = path ? path.split('/') : []
-		const segments: string[] = []
-
-		let isExternals = false
-		for (const part of parts) {
-			if (part === 'externals') {
-				isExternals = true
-				segments.push('externals')
-			} else if (isExternals) {
-				segments.push(toPascalCase(part))
-			} else {
-				segments.push(toCamelCase(part))
-			}
-		}
-		return ['revenge', ...segments].join('.')
+/** Resolves a module to the global path. Returns `null` for a type-only module. */
+function resolveExternal(id: string): ExternalTarget | null {
+	if (id in GlobalImportAliases) {
+		return { global: GlobalImportAliases[id]!, interop: 'cjs' }
 	}
 
-	throw new Error(`Cannot map import to a Revenge global: ${id}`)
+	const entry = ImportMap[id]
+	if (entry) {
+		return typeof entry === 'string'
+			? { global: entry, interop: 'namespace' }
+			: { global: entry.global, interop: entry.interop ?? 'namespace' }
+	}
+
+	if (TypeOnlyModules.has(id)) return null
+	throw new Error(
+		`Import cannot be resolved: ${id}\n\nCheck if the module is installed or @revenge-mod/types is up to date`,
+	)
 }
 
 /**
@@ -316,17 +315,45 @@ function extractImportedSymbols(
 		const source = node.source.value
 		if (!isExternal(source) || source.startsWith('react/jsx')) continue
 
-		const globalPath = toGlobalPath(source)
+		if (node.typeOnly) continue
 
-		for (const spec of node.specifiers || []) {
-			if (
-				spec.type === 'ImportDefaultSpecifier' ||
-				spec.type === 'ImportNamespaceSpecifier'
-			) {
-				symbolMap.set(spec.local.value, globalPath)
+		const valueSpecifiers = (node.specifiers ?? []).filter(
+			spec => !(spec.type === 'ImportSpecifier' && spec.isTypeOnly),
+		)
+		if (valueSpecifiers.length === 0) continue
+
+		const target = resolveExternal(source)
+		if (!target) continue
+
+		for (const spec of valueSpecifiers) {
+			if (spec.type === 'ImportDefaultSpecifier') {
+				// A `default` or `cjs` global already IS the default export.
+				symbolMap.set(
+					spec.local.value,
+					target.interop === 'namespace'
+						? `${target.global}.default`
+						: target.global,
+				)
+			} else if (spec.type === 'ImportNamespaceSpecifier') {
+				if (target.interop === 'default') {
+					throw new Error(
+						`${source} exposes its default export as \`${target.global}\`, so it has no namespace. Import the default instead of \`* as ${spec.local.value}\`.`,
+					)
+				}
+				symbolMap.set(spec.local.value, target.global)
 			} else if (spec.type === 'ImportSpecifier') {
 				const imported = spec.imported ? spec.imported.value : spec.local.value
-				symbolMap.set(spec.local.value, `${globalPath}.${imported}`)
+				if (target.interop === 'default' && imported !== 'default') {
+					throw new Error(
+						`${source} exposes its default export as \`${target.global}\`, so \`${imported}\` is not readable at runtime.`,
+					)
+				}
+				symbolMap.set(
+					spec.local.value,
+					target.interop === 'default'
+						? target.global
+						: `${target.global}.${imported}`,
+				)
 			}
 		}
 	}
@@ -747,7 +774,12 @@ every plugin is built.`)
 
 			const { output } = await bundle.generate({
 				format: 'iife',
-				globals: toGlobalPath,
+				globals: id => {
+					const target = resolveExternal(id)
+					if (!target) throw new Error(`${id} holds types only and has no global.`)
+
+					return target.global
+				},
 				exports: 'named',
 				esModule: false,
 				minify: dev ? 'dce-only' : true,
