@@ -4,7 +4,7 @@
  *   Local mode: a directory of plugin ZIPs:
  *       revenge-plugin generate-index --dist build/dist --base-url http://192.168.1.2:8080 [--out index.json]
  *
- *   Descriptor mode: a release-descriptor JSON produced by CI:
+ *   Descriptor mode: a pre-built list of local ZIPs and their final URLs:
  *       revenge-plugin generate-index --releases releases.json [--out index.json]
  *
  *     Descriptor shape: [{ "file": "<local path to the ZIP>", "url": "<final absolute asset URL>" }]
@@ -18,7 +18,14 @@
  */
 
 import { createHash } from 'node:crypto'
-import { existsSync, readdirSync, readFileSync, writeFileSync } from 'node:fs'
+import {
+	existsSync,
+	mkdirSync,
+	readdirSync,
+	readFileSync,
+	writeFileSync,
+} from 'node:fs'
+import { dirname } from 'node:path'
 import { parseArgs } from 'node:util'
 import { unzipSync } from 'fflate'
 
@@ -41,7 +48,7 @@ export function parseVersion(value: string): Version {
 	}
 }
 
-// Integers-only comparison
+// Integers-only comparison, as used for range satisfaction. Labels are ignored.
 export function compareVersions(a: Version, b: Version): number {
 	const len = Math.max(a.nums.length, b.nums.length)
 	for (let i = 0; i < len; i++) {
@@ -49,6 +56,46 @@ export function compareVersions(a: Version, b: Version): number {
 		if (diff !== 0) return diff
 	}
 	return 0
+}
+
+// Alternating runs of non-digits and digits: non-digits byte-lexically, digits numerically, so `rc2` < `rc10`.
+function compareLabels(a: string, b: string): number {
+	const runs = (label: string) => label.match(/\d+|\D+/g) ?? []
+	const left = runs(a)
+	const right = runs(b)
+
+	for (let i = 0; i < Math.max(left.length, right.length); i++) {
+		const x = left[i]
+		const y = right[i]
+		if (x === undefined) return -1
+		if (y === undefined) return 1
+
+		const bothDigits = /^\d/.test(x) && /^\d/.test(y)
+		const diff = bothDigits ? Number(x) - Number(y) : x < y ? -1 : x > y ? 1 : 0
+		if (diff !== 0) return diff
+	}
+	return 0
+}
+
+export function compareVersionsFull(a: Version, b: Version): number {
+	const nums = compareVersions(a, b)
+	if (nums !== 0) return nums
+	if (a.label === b.label) return 0
+	if (a.label === null) return 1
+	if (b.label === null) return -1
+	return compareLabels(a.label, b.label)
+}
+
+/** Newest of `versions` by the total order, or `null` when empty. */
+export function newestVersion(versions: string[]): string | null {
+	return versions.reduce<string | null>(
+		(best, cur) =>
+			best === null ||
+			compareVersionsFull(parseVersion(cur), parseVersion(best)) > 0
+				? cur
+				: best,
+		null,
+	)
 }
 
 function readZipEntry(zip: Uint8Array, entryName: string): Uint8Array | null {
@@ -73,10 +120,7 @@ interface Manifest {
 	author?: string
 	icon?: string
 	version: string
-	dependencies?: Record<
-		string,
-		{ version?: string; optional?: boolean; }
-	>
+	dependencies?: Record<string, { version?: string; optional?: boolean }>
 }
 
 function validateManifest(manifest: Manifest, source: string): void {
@@ -166,7 +210,7 @@ function collectArtifacts(args: {
 	}
 
 	throw new Error(
-		'Pass either --dist <dir> --base-url <url> or --releases <descriptor.json>',
+		'Pass --dist <dir> --base-url <url>, or --releases <descriptor.json>',
 	)
 }
 
@@ -211,6 +255,8 @@ export async function run(argv: string[]): Promise<void> {
 	})
 	const index = generateIndex(artifacts, loadRepoConfig())
 
+	const outDir = dirname(values.out)
+	if (outDir && outDir !== '.') mkdirSync(outDir, { recursive: true })
 	writeFileSync(values.out, `${JSON.stringify(index, null, 2)}\n`)
 	console.log(
 		`\u2713 Wrote ${values.out}: ${Object.keys(index.plugins).length} plugin(s), ${artifacts.length} artifact(s)`,
@@ -254,7 +300,7 @@ export function generateIndex(artifacts: Artifact[], config: RepoConfig = {}) {
 				throw new Error(`Duplicate version ${manifest.id}@${manifest.version}`)
 			existing.versions[manifest.version] = entry
 			// Display metadata follows the newest version's manifest.
-			if (compareVersions(version, existing._newest) > 0) {
+			if (compareVersionsFull(version, existing._newest) > 0) {
 				existing._newest = version
 				existing._manifest = manifest
 			}
@@ -280,7 +326,7 @@ export function generateIndex(artifacts: Artifact[], config: RepoConfig = {}) {
 		)
 		const newest = (candidates: (readonly [string, Version])[]) =>
 			candidates.reduce((best, cur) =>
-				compareVersions(cur[1], best[1]) > 0 ? cur : best,
+				compareVersionsFull(cur[1], best[1]) > 0 ? cur : best,
 			)
 
 		const channels: Record<string, string> = {}
