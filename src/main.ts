@@ -3,6 +3,7 @@ const USAGE = `Usage: revenge-plugin <command> [options]
 Commands:
   build [names...] [--dev]        Bundle every (or the named) plugin's JS
   generate-index [options]        Write a repository index.json from plugin ZIPs
+  plan-releases [options]         List the plugins whose manifest version is not yet released
   serve [options]                 Serve a local repository (index + ZIPs) for device testing
 
 Run against a plugin repo root (the directory containing plugins/).
@@ -27,6 +28,9 @@ switch (command) {
 		break
 	case 'generate-index':
 		await dispatch(() => import('./generate-index.ts'))
+		break
+	case 'plan-releases':
+		await dispatch(() => import('./plan-releases.ts'))
 		break
 	case 'serve':
 		await dispatch(() => import('./serve.ts'))
