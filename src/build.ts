@@ -2,9 +2,15 @@ import { existsSync, readdirSync, readFileSync } from 'node:fs'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { extname } from 'node:path'
 import { parseArgs } from 'node:util'
-import hiddenImportMap from '@revenge-mod/types/modules.hidden.importmap.json' with { type: 'json' }
-import hiddenModules from '@revenge-mod/types/modules.hidden.json' with { type: 'json' }
-import publicImportMap from '@revenge-mod/types/modules.importmap.json' with { type: 'json' }
+import hiddenImportMap from '@revenge-mod/types/modules.hidden.importmap.json' with {
+	type: 'json',
+}
+import hiddenModules from '@revenge-mod/types/modules.hidden.json' with {
+	type: 'json',
+}
+import publicImportMap from '@revenge-mod/types/modules.importmap.json' with {
+	type: 'json',
+}
 import modules from '@revenge-mod/types/modules.json' with { type: 'json' }
 import { parseSync, transform as swcTransform } from '@swc/core'
 import { rolldown } from 'rolldown'
@@ -34,8 +40,10 @@ const GlobalImportAliases: Record<string, string> = {
 	'@shopify/flash-list': 'revenge.externals.Shopify.FlashList',
 	'@react-native-clipboard/clipboard':
 		'revenge.externals.ReactNativeClipboard.Clipboard',
-	'@react-navigation/stack': 'revenge.externals.ReactNavigation.ReactNavigationStack',
-	'@react-navigation/native': 'revenge.externals.ReactNavigation.ReactNavigationNative',
+	'@react-navigation/stack':
+		'revenge.externals.ReactNavigation.ReactNavigationStack',
+	'@react-navigation/native':
+		'revenge.externals.ReactNavigation.ReactNavigationNative',
 }
 
 const ImportMap = {
@@ -550,10 +558,7 @@ function applyEditsToBuffer(code: string, edits: TextEdit[]): string {
  * Rewrites one module: external imports are erased and every use of an imported symbol becomes a property access on `revenge`.
  * Returns `null` when the module imports nothing external.
  */
-export function inlineExternalImports(
-	code: string,
-	id: string,
-): string | null {
+export function inlineExternalImports(code: string, id: string): string | null {
 	if (!/\.[jt]sx?$/.test(id) || id.includes('node_modules')) return null
 
 	const isTs = id.endsWith('.ts') || id.endsWith('.tsx')
@@ -747,7 +752,7 @@ every plugin is built.`)
 				transform: {
 					target: 'es2020',
 					jsx: {
-						// Compiles to `react/jsx-runtime` imports, which remaps to `revenge.react.ReactJSXRuntime`. 
+						// Compiles to `react/jsx-runtime` imports, which remaps to `revenge.react.ReactJSXRuntime`.
 						runtime: 'automatic',
 						// We don't expose jsxDev
 						development: false,
@@ -776,7 +781,8 @@ every plugin is built.`)
 				format: 'iife',
 				globals: id => {
 					const target = resolveExternal(id)
-					if (!target) throw new Error(`${id} holds types only and has no global.`)
+					if (!target)
+						throw new Error(`${id} holds types only and has no global.`)
 
 					return target.global
 				},
