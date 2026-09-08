@@ -19,13 +19,13 @@
 
 import { createHash } from 'node:crypto'
 import {
-	existsSync,
-	mkdirSync,
-	readdirSync,
-	readFileSync,
-	writeFileSync,
+    existsSync,
+    mkdirSync,
+    readdirSync,
+    readFileSync,
+    writeFileSync,
 } from 'node:fs'
-import { dirname } from 'node:path'
+import { basename, dirname } from 'node:path'
 import { parseArgs } from 'node:util'
 import { unzipSync } from 'fflate'
 
@@ -154,6 +154,21 @@ function validateManifest(manifest: Manifest, source: string): void {
 		)
 }
 
+export function poolFileName(id: string, version: string): string {
+	return `${id}@${version}.zip`
+}
+
+export function parsePoolFileName(
+	name: string,
+): { id: string; version: string } | null {
+	const match = /^([^@/\\]+)@([^@/\\]+)\.zip$/.exec(name)
+	if (!match) return null
+
+	const [, id = '', version = ''] = match
+	if (!PLUGIN_ID_REGEX.test(id) || !VERSION_REGEX.test(version)) return null
+	return { id, version }
+}
+
 // ---------------------------------------------------------------------------
 // Index generation
 // ---------------------------------------------------------------------------
@@ -178,7 +193,7 @@ export function loadRepoConfig(path = 'repo.config.json'): RepoConfig {
 		: {}
 }
 
-function collectArtifacts(args: {
+export function collectArtifacts(args: {
 	dist?: string
 	baseUrl?: string
 	releases?: string
@@ -206,7 +221,13 @@ function collectArtifacts(args: {
 		return readdirSync(args.dist)
 			.filter(name => name.endsWith('.zip'))
 			.sort()
-			.map(name => ({ file: `${args.dist}/${name}`, url: `${base}/${name}` }))
+			.map(name => {
+				if (!parsePoolFileName(name))
+					throw new Error(
+						`${args.dist}/${name}: artifacts must be named <id>@<version>.zip`,
+					)
+				return { file: `${args.dist}/${name}`, url: `${base}/${name}` }
+			})
 	}
 
 	throw new Error(
@@ -281,6 +302,15 @@ export function generateIndex(artifacts: Artifact[], config: RepoConfig = {}) {
 		) as Manifest
 		validateManifest(manifest, artifact.file)
 		const version = parseVersion(manifest.version)
+
+		const claimed = parsePoolFileName(basename(artifact.file))
+		if (
+			claimed &&
+			(claimed.id !== manifest.id || claimed.version !== manifest.version)
+		)
+			throw new Error(
+				`${artifact.file}: named ${claimed.id}@${claimed.version}, but holds ${manifest.id}@${manifest.version}`,
+			)
 
 		const entry: IndexVersion = {
 			url: artifact.url,

@@ -1,33 +1,35 @@
 /**
  * Release planner
  *
- *     revenge-plugin plan-releases [--plugins-dir plugins] [--dist build/dist] [--out releases.json]
+ *     revenge-plugin plan-releases --pool <dir> [--plugins-dir plugins] [--dist build/dist] [--out releases.json]
  *
- * A plugin is released when its `manifest.json` version has no matching `<name>@<version>` tag.
- * The plan is a JSON array that CI turns into tags and releases:
+ * A plugin is released when the published pool holds `<id>@<version>.zip`. The pool is the only
+ * ledger, so a half-finished publish leaves nothing behind and re-running the release is safe.
+ * The pool is keyed by plugin id, which means renaming a plugin folder keeps its history.
  *
- *     [{ "name": "...", "id": "...", "version": "...", "tag": "...", "zip": "..." }]
+ * The plan is a JSON array that CI copies into the pool:
  *
- * Run it locally to see what a push to the release branch would publish.
- * It never writes tags, and it fails on an invalid or downgraded version.
+ *     [{ "name": "...", "id": "...", "version": "...", "tag": "...", "zip": "...", "file": "..." }]
  *
- * The planner reads Git only. It is the CI's job to take the plan and create the actual releases.
+ * Run it against a checkout of the published branch to see what a release would publish.
+ * It writes nothing to the pool, and it fails on an invalid or downgraded version.
  */
 
-import { execFileSync } from 'node:child_process'
 import {
-	existsSync,
-	mkdirSync,
-	readdirSync,
-	readFileSync,
-	writeFileSync,
+    existsSync,
+    mkdirSync,
+    readdirSync,
+    readFileSync,
+    writeFileSync,
 } from 'node:fs'
 import { dirname } from 'node:path'
 import { parseArgs } from 'node:util'
 import {
-	compareVersionsFull,
-	newestVersion,
-	parseVersion,
+    compareVersionsFull,
+    newestVersion,
+    parsePoolFileName,
+    parseVersion,
+    poolFileName,
 } from './generate-index.ts'
 
 export interface PluginSource {
@@ -39,13 +41,16 @@ export interface PluginSource {
 
 export interface PlannedRelease extends PluginSource {
 	tag: string
+	/** Built artifact to publish. */
 	zip: string
+	/** Name it takes inside the pool. */
+	file: string
 }
 
 /** Decides which plugins to release. */
 export function planReleases(
 	plugins: PluginSource[],
-	releasedVersions: (name: string) => string[],
+	releasedVersions: (id: string) => string[],
 	distDir = 'build/dist',
 ): PlannedRelease[] {
 	const plan: PlannedRelease[] = []
@@ -61,9 +66,9 @@ export function planReleases(
 			throw new Error(`${name}: invalid version '${version}'`)
 		}
 
-		const released = releasedVersions(name)
+		const released = releasedVersions(id)
 		if (released.includes(version)) {
-			console.log(`= ${name}@${version} already released`)
+			console.log(`= ${id}@${version} already published`)
 			continue
 		}
 
@@ -75,15 +80,17 @@ export function planReleases(
 			compareVersionsFull(parseVersion(version), parseVersion(newest)) < 0
 		)
 			throw new Error(
-				`${name}: manifest version ${version} is below released ${newest}`,
+				`${name}: manifest version ${version} is below published ${newest}`,
 			)
 
+		const file = poolFileName(id, version)
 		plan.push({
 			name,
 			id,
 			version,
 			tag: `${name}@${version}`,
-			zip: `${distDir}/${id}.zip`,
+			zip: `${distDir}/${file}`,
+			file,
 		})
 	}
 
@@ -112,32 +119,27 @@ export function readPluginSources(pluginsDir = 'plugins'): PluginSource[] {
 	return sources
 }
 
-/** Groups `git tag` output into the versions released per plugin name. */
-export function readReleasedVersions(): Map<string, string[]> {
-	let output: string
-	try {
-		output = execFileSync('git', ['tag', '--list'], { encoding: 'utf8' })
-	} catch {
-		throw new Error('Cannot read git tags; is this a git repository?')
-	}
+/** Groups the published pool into the versions released per plugin id. */
+export function readPooledVersions(poolDir: string): Map<string, string[]> {
+	if (!existsSync(poolDir))
+		throw new Error(
+			`No pool directory at '${poolDir}'. Check out the published branch first, ` +
+				'because an absent pool looks like an empty one and republishes everything.',
+		)
 
 	const released = new Map<string, string[]>()
-	for (const tag of output.split('\n')) {
-		const at = tag.indexOf('@')
-		if (at <= 0) continue
+	for (const name of readdirSync(poolDir)) {
+		if (!name.endsWith('.zip')) continue
 
-		const name = tag.slice(0, at)
-		const version = tag.slice(at + 1)
-		// A tag can predate the current version grammar; it is history, not input.
-		try {
-			parseVersion(version)
-		} catch {
-			continue
-		}
+		// Every artifact must be `<id>@<version>.zip`. Skipping the odd one out would hide a
+		// published version from the planner and let a later release collide with it.
+		const parsed = parsePoolFileName(name)
+		if (!parsed)
+			throw new Error(`${poolDir}/${name}: not an '<id>@<version>.zip' artifact`)
 
-		const versions = released.get(name)
-		if (versions) versions.push(version)
-		else released.set(name, [version])
+		const versions = released.get(parsed.id)
+		if (versions) versions.push(parsed.version)
+		else released.set(parsed.id, [parsed.version])
 	}
 	return released
 }
@@ -146,6 +148,7 @@ export async function run(argv: string[]): Promise<void> {
 	const { values } = parseArgs({
 		args: argv,
 		options: {
+			pool: { type: 'string' },
 			'plugins-dir': { type: 'string', default: 'plugins' },
 			dist: { type: 'string', default: 'build/dist' },
 			out: { type: 'string', default: 'releases.json' },
@@ -154,19 +157,24 @@ export async function run(argv: string[]): Promise<void> {
 	})
 	if (values.help) {
 		console.log(
-			'Usage: revenge-plugin plan-releases [--plugins-dir <dir>] [--dist <dir>] [--out <file>]',
+			'Usage: revenge-plugin plan-releases --pool <dir> [--plugins-dir <dir>] [--dist <dir>] [--out <file>]',
 		)
 		return
 	}
 
-	const released = readReleasedVersions()
+	if (!values.pool)
+		throw new Error(
+			'Pass --pool <dir>, a checkout of the published pool that holds <id>@<version>.zip',
+		)
+
+	const released = readPooledVersions(values.pool)
 	const plan = planReleases(
 		readPluginSources(values['plugins-dir']),
-		name => released.get(name) ?? [],
+		id => released.get(id) ?? [],
 		values.dist,
 	)
 
-	for (const release of plan) console.log(`+ ${release.tag}`)
+	for (const release of plan) console.log(`+ ${release.file}`)
 
 	const outDir = dirname(values.out)
 	if (outDir && outDir !== '.') mkdirSync(outDir, { recursive: true })
